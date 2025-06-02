@@ -66,7 +66,7 @@ python gradio_diffretouch.py \
 
 ## 📜 License
 
-This project is licensed under the Pi-Lab License 1.0 - see the [LICENSE](https://github.com/modyu-liu/FaceMe/blob/main/LICENSE) file for details.
+This project is licensed under the Pi-Lab License 1.0 - see the [LICENSE](https://github.com/Adam-duan/DiffRetouch/blob/main/LICENSE) file for details.
 
 ## :book: Citation
 
