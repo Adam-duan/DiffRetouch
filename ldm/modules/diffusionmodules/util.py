@@ -1,0 +1,393 @@
+# adopted from
+# https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
+# and
+# https://github.com/lucidrains/denoising-diffusion-pytorch/blob/7706bdfc6f527f58d33f84b7b522e61e6e3164b3/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py
+# and
+# https://github.com/openai/guided-diffusion/blob/0ba878e517b276c45d1195eb29f6f5f72659a05b/guided_diffusion/nn.py
+#
+# thanks!
+
+
+import os
+import math
+import torch
+import torch.nn as nn
+import numpy as np
+from einops import repeat
+import torch.nn.functional as F
+
+from ldm.util import instantiate_from_config, boxfilter2d, batch_det
+
+
+def make_beta_schedule(schedule, n_timestep, linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
+    if schedule == "linear":
+        betas = (
+                torch.linspace(linear_start ** 0.5, linear_end ** 0.5, n_timestep, dtype=torch.float64) ** 2
+        )
+
+    elif schedule == "cosine":
+        timesteps = (
+                torch.arange(n_timestep + 1, dtype=torch.float64) / n_timestep + cosine_s
+        )
+        alphas = timesteps / (1 + cosine_s) * np.pi / 2
+        alphas = torch.cos(alphas).pow(2)
+        alphas = alphas / alphas[0]
+        betas = 1 - alphas[1:] / alphas[:-1]
+        betas = np.clip(betas, a_min=0, a_max=0.999)
+
+    elif schedule == "squaredcos_cap_v2":  # used for karlo prior
+        # return early
+        return betas_for_alpha_bar(
+            n_timestep,
+            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
+        )
+
+    elif schedule == "sqrt_linear":
+        betas = torch.linspace(linear_start, linear_end, n_timestep, dtype=torch.float64)
+    elif schedule == "sqrt":
+        betas = torch.linspace(linear_start, linear_end, n_timestep, dtype=torch.float64) ** 0.5
+    else:
+        raise ValueError(f"schedule '{schedule}' unknown.")
+    return betas.numpy()
+
+
+def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timesteps, verbose=True):
+    if ddim_discr_method == 'uniform':
+        c = num_ddpm_timesteps // num_ddim_timesteps
+        ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
+        # ddim_timesteps = np.flip(np.asarray(list(range(num_ddpm_timesteps-2, 0, -c))))
+    elif ddim_discr_method == 'quad':
+        ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .8), num_ddim_timesteps)) ** 2).astype(int)
+    else:
+        raise NotImplementedError(f'There is no ddim discretization method called "{ddim_discr_method}"')
+
+    # assert ddim_timesteps.shape[0] == num_ddim_timesteps
+    # add one to get the final alpha values right (the ones from first scale to data during sampling)
+    steps_out = ddim_timesteps + 1
+    if verbose:
+        print(f'Selected timesteps for ddim sampler: {steps_out}')
+    return steps_out
+
+
+def make_ddim_sampling_parameters(alphacums, ddim_timesteps, eta, verbose=True):
+    # select alphas for computing the variance schedule
+    alphas = alphacums[ddim_timesteps]
+    alphas_prev = np.asarray([alphacums[0]] + alphacums[ddim_timesteps[:-1]].tolist())
+
+    # according the the formula provided in https://arxiv.org/abs/2010.02502
+    sigmas = eta * np.sqrt((1 - alphas_prev) / (1 - alphas) * (1 - alphas / alphas_prev))
+    if verbose:
+        print(f'Selected alphas for ddim sampler: a_t: {alphas}; a_(t-1): {alphas_prev}')
+        print(f'For the chosen value of eta, which is {eta}, '
+              f'this results in the following sigma_t schedule for ddim sampler {sigmas}')
+    return sigmas, alphas, alphas_prev
+
+
+def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
+    """
+    Create a beta schedule that discretizes the given alpha_t_bar function,
+    which defines the cumulative product of (1-beta) over time from t = [0,1].
+    :param num_diffusion_timesteps: the number of betas to produce.
+    :param alpha_bar: a lambda that takes an argument t from 0 to 1 and
+                      produces the cumulative product of (1-beta) up to that
+                      part of the diffusion process.
+    :param max_beta: the maximum beta to use; use values lower than 1 to
+                     prevent singularities.
+    """
+    betas = []
+    for i in range(num_diffusion_timesteps):
+        t1 = i / num_diffusion_timesteps
+        t2 = (i + 1) / num_diffusion_timesteps
+        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+    return np.array(betas)
+
+
+def extract_into_tensor(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+
+def checkpoint(func, inputs, params, flag):
+    """
+    Evaluate a function without caching intermediate activations, allowing for
+    reduced memory at the expense of extra compute in the backward pass.
+    :param func: the function to evaluate.
+    :param inputs: the argument sequence to pass to `func`.
+    :param params: a sequence of parameters `func` depends on but does not
+                   explicitly take as arguments.
+    :param flag: if False, disable gradient checkpointing.
+    """
+    if flag:
+        args = tuple(inputs) + tuple(params)
+        return CheckpointFunction.apply(func, len(inputs), *args)
+    else:
+        return func(*inputs)
+
+
+class CheckpointFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, run_function, length, *args):
+        ctx.run_function = run_function
+        ctx.input_tensors = list(args[:length])
+        ctx.input_params = list(args[length:])
+        ctx.gpu_autocast_kwargs = {"enabled": torch.is_autocast_enabled(),
+                                   "dtype": torch.get_autocast_gpu_dtype(),
+                                   "cache_enabled": torch.is_autocast_cache_enabled()}
+        with torch.no_grad():
+            output_tensors = ctx.run_function(*ctx.input_tensors)
+        return output_tensors
+
+    @staticmethod
+    def backward(ctx, *output_grads):
+        ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
+        with torch.enable_grad(), \
+                torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs):
+            # Fixes a bug where the first op in run_function modifies the
+            # Tensor storage in place, which is not allowed for detach()'d
+            # Tensors.
+            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
+            output_tensors = ctx.run_function(*shallow_copies)
+        input_grads = torch.autograd.grad(
+            output_tensors,
+            ctx.input_tensors + ctx.input_params,
+            output_grads,
+            allow_unused=True,
+        )
+        del ctx.input_tensors
+        del ctx.input_params
+        del output_tensors
+        return (None, None) + input_grads
+
+
+def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
+    """
+    Create sinusoidal timestep embeddings.
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an [N x dim] Tensor of positional embeddings.
+    """
+    if not repeat_only:
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=timesteps.device)
+        args = timesteps[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    else:
+        embedding = repeat(timesteps, 'b -> b d', d=dim)
+    return embedding
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+def scale_module(module, scale):
+    """
+    Scale the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().mul_(scale)
+    return module
+
+
+def mean_flat(tensor):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
+
+def normalization(channels):
+    """
+    Make a standard normalization layer.
+    :param channels: number of input channels.
+    :return: an nn.Module for normalization.
+    """
+    return GroupNorm32(32, channels)
+
+
+# PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
+class SiLU(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
+class GroupNorm32(nn.GroupNorm):
+    def forward(self, x):
+        return super().forward(x.float()).type(x.dtype)
+
+
+def conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def linear(*args, **kwargs):
+    """
+    Create a linear module.
+    """
+    return nn.Linear(*args, **kwargs)
+
+
+def avg_pool_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D average pooling module.
+    """
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+class HybridConditioner(nn.Module):
+
+    def __init__(self, c_concat_config, c_crossattn_config):
+        super().__init__()
+        self.concat_conditioner = instantiate_from_config(c_concat_config)
+        self.crossattn_conditioner = instantiate_from_config(c_crossattn_config)
+
+    def forward(self, c_concat, c_crossattn):
+        c_concat = self.concat_conditioner(c_concat)
+        c_crossattn = self.crossattn_conditioner(c_crossattn)
+        return {'c_concat': [c_concat], 'c_crossattn': [c_crossattn]}
+
+
+def noise_like(shape, device, repeat=False):
+    repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
+    noise = lambda: torch.randn(shape, device=device)
+    return repeat_noise() if repeat else noise()
+
+def guidedfilter2d_latent(guide, src, radius=2, eps=1e-4, scale=None):
+    """guided filter for a color guide image
+    
+    Parameters
+    -----
+    guide: (B, 3, H, W)-dim torch.Tensor
+        guide image
+    src: (B, C, H, W)-dim torch.Tensor
+        filtering image
+    radius: int
+        filter radius
+    eps: float
+        regularization coefficient
+    """
+    assert guide.shape[1] == 4
+    if src.ndim == 3:
+        src = src[:, None]
+    if scale is not None:
+        guide_sub = guide.clone()
+        src = F.interpolate(src, scale_factor=1./scale, mode="nearest")
+        guide = F.interpolate(guide, scale_factor=1./scale, mode="nearest")
+        radius = radius // scale
+
+    guide_1, guide_2, guide_3, guide_4 = torch.chunk(guide, 4, 1) # b x 1 x H x W
+    ones = torch.ones_like(guide_1)
+    N = boxfilter2d(ones, radius)
+
+    mean_I = boxfilter2d(guide, radius) / N # b x 3 x H x W
+    mean_I_1, mean_I_2, mean_I_3, mean_I_4 = torch.chunk(mean_I, 4, 1) # b x 1 x H x W
+
+    mean_p = boxfilter2d(src, radius) / N # b x C x H x W
+
+    mean_Ip_1 = boxfilter2d(guide_1 * src, radius) / N # b x C x H x W
+    mean_Ip_2 = boxfilter2d(guide_2 * src, radius) / N # b x C x H x W
+    mean_Ip_3 = boxfilter2d(guide_3 * src, radius) / N # b x C x H x W
+    mean_Ip_4 = boxfilter2d(guide_4 * src, radius) / N # b x C x H x W
+
+    cov_Ip_1 = mean_Ip_1 - mean_I_1 * mean_p # b x C x H x W
+    cov_Ip_2 = mean_Ip_2 - mean_I_2 * mean_p # b x C x H x W
+    cov_Ip_3 = mean_Ip_3 - mean_I_3 * mean_p # b x C x H x W
+    cov_Ip_4 = mean_Ip_4 - mean_I_4 * mean_p # b x C x H x W
+
+    var_I_11 = boxfilter2d(guide_1 * guide_1, radius) / N - mean_I_1 * mean_I_1 + eps # b x 1 x H x W
+    var_I_12 = boxfilter2d(guide_1 * guide_2, radius) / N - mean_I_1 * mean_I_2 # b x 1 x H x W
+    var_I_13 = boxfilter2d(guide_1 * guide_3, radius) / N - mean_I_1 * mean_I_3  # b x 1 x H x W
+    var_I_14 = boxfilter2d(guide_1 * guide_4, radius) / N - mean_I_1 * mean_I_4  # b x 1 x H x W
+    var_I_22 = boxfilter2d(guide_2 * guide_2, radius) / N - mean_I_2 * mean_I_2 + eps # b x 1 x H x W
+    var_I_23 = boxfilter2d(guide_2 * guide_3, radius) / N - mean_I_2 * mean_I_3  # b x 1 x H x W
+    var_I_24 = boxfilter2d(guide_2 * guide_4, radius) / N - mean_I_2 * mean_I_4  # b x 1 x H x W
+    var_I_33 = boxfilter2d(guide_3 * guide_3, radius) / N - mean_I_3 * mean_I_3 + eps # b x 1 x H x W
+    var_I_34 = boxfilter2d(guide_3 * guide_4, radius) / N - mean_I_3 * mean_I_4 # b x 1 x H x W
+    var_I_44 = boxfilter2d(guide_4 * guide_4, radius) / N - mean_I_4 * mean_I_4 + eps # b x 1 x H x W
+
+    b, C, H, W = var_I_11.shape
+
+    # determinant
+    # var_I_11_v = var_I_11.reshape(b, C, H*W).transpose(1,2)
+    # var_I_12_v = var_I_12.reshape(b, C, H*W).transpose(1,2)
+    # var_I_13_v = var_I_13.reshape(b, C, H*W).transpose(1,2)
+    # var_I_14_v = var_I_14.reshape(b, C, H*W).transpose(1,2)
+    # var_I_22_v = var_I_22.reshape(b, C, H*W).transpose(1,2)
+    # var_I_23_v = var_I_23.reshape(b, C, H*W).transpose(1,2)
+    # var_I_24_v = var_I_24.reshape(b, C, H*W).transpose(1,2)
+    # var_I_33_v = var_I_33.reshape(b, C, H*W).transpose(1,2)
+    # var_I_34_v = var_I_34.reshape(b, C, H*W).transpose(1,2)
+    # var_I_44_v = var_I_44.reshape(b, C, H*W).transpose(1,2)
+    # a_1 = torch.stack([var_I_11_v, var_I_12_v, var_I_13_v, var_I_14_v], dim=-1)
+    # a_2 = torch.stack([var_I_12_v, var_I_22_v, var_I_23_v, var_I_24_v], dim=-1)
+    # a_3 = torch.stack([var_I_13_v, var_I_23_v, var_I_33_v, var_I_34_v], dim=-1)
+    # a_4 = torch.stack([var_I_14_v, var_I_24_v, var_I_34_v, var_I_44_v], dim=-1)
+    # a = torch.cat([a_1, a_2, a_3, a_4], dim = -2)
+    # cov_det = torch.det(a)
+    # cov_det = cov_det.reshape(b, C, H, W)
+    cov_det = batch_det([var_I_11, var_I_12, var_I_13, var_I_14, var_I_12, var_I_22, var_I_23, var_I_24, var_I_13, var_I_23, var_I_33, var_I_34, var_I_14, var_I_24, var_I_34, var_I_44], 4)
+
+    # inverse
+    inv_var_I_11 = batch_det([var_I_22, var_I_23, var_I_24, var_I_23, var_I_33, var_I_34, var_I_24, var_I_34, var_I_44], 3) / cov_det # b x 1 x H x W
+    inv_var_I_12 = - batch_det([var_I_12, var_I_23, var_I_24, var_I_13, var_I_33, var_I_34, var_I_14, var_I_34, var_I_44], 3) / cov_det # b x 1 x H x W
+    inv_var_I_13 = batch_det([var_I_12, var_I_22, var_I_24, var_I_13, var_I_23, var_I_34, var_I_14, var_I_24, var_I_44], 3) / cov_det # b x 1 x H x W
+    inv_var_I_14 = - batch_det([var_I_12, var_I_22, var_I_23, var_I_13, var_I_23, var_I_33, var_I_14, var_I_24, var_I_34], 3) / cov_det # b x 1 x H x W
+    inv_var_I_22 = batch_det([var_I_11, var_I_13, var_I_14, var_I_13, var_I_33, var_I_34, var_I_14, var_I_34, var_I_44], 3) / cov_det # b x 1 x H x W
+    inv_var_I_23 = - batch_det([var_I_11, var_I_12, var_I_14, var_I_13, var_I_23, var_I_34, var_I_14, var_I_24, var_I_44], 3) / cov_det # b x 1 x H x W
+    inv_var_I_24 = batch_det([var_I_11, var_I_12, var_I_13, var_I_13, var_I_23, var_I_33, var_I_14, var_I_24, var_I_34], 3) / cov_det # b x 1 x H x W
+    inv_var_I_33 = batch_det([var_I_11, var_I_12, var_I_14, var_I_12, var_I_22, var_I_24, var_I_14, var_I_24, var_I_44], 3) / cov_det # b x 1 x H x W
+    inv_var_I_34 = - batch_det([var_I_11, var_I_12, var_I_13, var_I_12, var_I_22, var_I_23, var_I_14, var_I_24, var_I_34], 3) / cov_det # b x 1 x H x W
+    inv_var_I_44 = batch_det([var_I_11, var_I_12, var_I_13, var_I_12, var_I_22, var_I_23, var_I_13, var_I_23, var_I_33], 3) / cov_det # b x 1 x H x W
+
+    inv_sigma = torch.stack([
+        torch.stack([inv_var_I_11, inv_var_I_12, inv_var_I_13, inv_var_I_14], 1),
+        torch.stack([inv_var_I_12, inv_var_I_22, inv_var_I_23, inv_var_I_24], 1),
+        torch.stack([inv_var_I_13, inv_var_I_23, inv_var_I_33, inv_var_I_34], 1),
+        torch.stack([inv_var_I_14, inv_var_I_24, inv_var_I_34, inv_var_I_44], 1)
+    ], 1).squeeze(-3) # b x 3 x 3 x H x W
+
+    cov_Ip = torch.stack([cov_Ip_1, cov_Ip_2, cov_Ip_3, cov_Ip_4], 1) # b x 3 x C x H x W
+
+    a = torch.einsum("bichw,bijhw->bjchw", (cov_Ip, inv_sigma))
+    b = mean_p - a[:, 0] * mean_I_1 - a[:, 1] * mean_I_2 - a[:, 2] * mean_I_3 - a[:, 3] * mean_I_4  # b x C x H x W
+
+    mean_a = torch.stack([boxfilter2d(a[:, i], radius) / N for i in range(4)], 1)
+    mean_b = boxfilter2d(b, radius) / N
+
+    # print(mean_a)
+
+    if scale is not None:
+        guide = guide_sub
+        mean_a = torch.stack([F.interpolate(mean_a[:, i], guide.shape[-2:], mode='bilinear') for i in range(4)], 1)
+        mean_b = F.interpolate(mean_b, guide.shape[-2:], mode='bilinear')
+
+    q = torch.einsum("bichw,bihw->bchw", (mean_a, guide)) + mean_b
+
+    return q
