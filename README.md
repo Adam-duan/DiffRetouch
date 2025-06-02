@@ -49,9 +49,9 @@ Download the [[test_data.zip](https://huggingface.co/acceptee/DiffRetouch)] and 
 
 ```bash
 bash test_adobe.sh/test_ppr.sh \
-    --promptdir      \      # Specify the expert style, e.g. '01-Experts-A' for Adobe5K and 'target_a' for PPR10K
-    --seed           \      # Set the random seed
-    --steps          \      # Set the number of diffusion steps, 20 by default
+    promptdir      \      # Specify the expert style, e.g. '01-Experts-A' for Adobe5K and 'target_a' for PPR10K
+    seed           \      # Set the random seed
+    steps          \      # Set the number of diffusion steps, 20 by default
 ```
 
 **Step 4: Check the results**
@@ -61,7 +61,7 @@ The processed results will be saved in the `results/` directory.
 **:seedling: Gradio Demo**
 ```bash
 python gradio_diffretouch.py \
-    --ckpt_path   \         # Specify the checkpoint path, e.g. 'diffretouch_models/adobe.ckpt'
+    --ckpt_path   \       # Specify the checkpoint path, e.g. 'diffretouch_models/adobe.ckpt'
 ```
 
 ## 📜 License
