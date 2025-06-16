@@ -30,7 +30,7 @@ cd DiffRetouch
 2. Install packages
 ```bash
 conda env create --file environment.yaml
-conda activate faceme
+conda activate diffretouch
 ```
 
 
@@ -63,6 +63,8 @@ The processed results will be saved in the `results/` directory.
 python gradio_diffretouch.py \
     --ckpt_path   \       # Specify the checkpoint path, e.g. 'diffretouch_models/adobe.ckpt'
 ```
+
+![gradio_img](assets/gradio.jpg)
 
 ## 📜 License
 
